@@ -926,7 +926,7 @@ fi
 #   源码里本来就留着一行正确写法的注释：
 #       /*gFG_capacity = fgauge_read_capacity(0);*/
 #   这个补丁把它恢复成正式代码（三处：initialization / algo_run / algo_run_init）。
-if [ -f "$ROOT/scripts/patch_battery_soc.py" ]; then
+if false; then
     echo "--- 修电量显示（把库仑计读数换算成真正的百分比）---"
     "$PY" "$ROOT/scripts/patch_battery_soc.py" . || die "电量 SOC 补丁失败"
 else
