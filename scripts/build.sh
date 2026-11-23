@@ -83,6 +83,7 @@ for s in \
     patch_sensors.py \
     patch_battery_qmax.py patch_battery_soc.py patch_battery_fgadc.py \
     patch_lcm_stock.py patch_lcm_init.py patch_lcm_table.py \
+    patch_lcm_gpio_fix.py \
     patch_lcm_debug.py patch_lcm_esd_off.py patch_dsi_start.py \
     patch_disp_debug.py patch_lcm_trace.py patch_lcm_power_seq.py patch_lcm_readid.py \
     patch_dimming_cmdmode.py patch_dimming_early.py patch_rst_new.py patch_stock_timing.py patch_lab_push.py \
@@ -560,6 +561,21 @@ else
     LCM_TABLE_FILE="$ROOT/kernel-patches/lcm-table/stock_tables.c"
     echo "--- 使用原厂 BOE 表（原厂能亮的那一套）---"
 fi
+# ---- 面板 GPIO 修复补丁：默认关闭（已被上面的 sed 覆盖，不要重复）----
+# 上面行 ~500 处的 sed 已经完成了同样的事：
+#   "mediatek,mt8173-lcm" -> "mediatek,nt35523_fhd"
+#   gpio_lcm_1v8_en/vsp_en -> gpio_lcd_enp, gpio_lcm_vsn_en -> gpio_lcd_enn
+#   gpio_lcm_rst_en/rst_en_new -> gpio_lcd_rst
+#   goto out; -> ;   （避免第二次 request 返回 -EBUSY 时放弃整个初始化）
+# 所以 patch_lcm_gpio_fix.py 会因锚点不匹配而失败，默认不跑。
+# 如需启用（例如换了一棵没做过 sed 的树），设 LCM_GPIO_FIX=1。
+if [ "${LCM_GPIO_FIX:-0}" = "1" ] && [ -f "$ROOT/scripts/patch_lcm_gpio_fix.py" ]; then
+    echo "--- 面板 GPIO 修复补丁（node/属性名两级回退）---"
+    "$PY" "$ROOT/scripts/patch_lcm_gpio_fix.py" . || die "面板 GPIO 修复失败"
+else
+    echo "跳过面板 GPIO 修复补丁（已由前置 sed 完成；LCM_GPIO_FIX=${LCM_GPIO_FIX:-0}）"
+fi
+
 if [ "${LCM_STOCK:-1}" = "1" ] && [ "${LCMPATCH:-1}" = "1" ] \
    && [ -f "$ROOT/scripts/patch_lcm_stock.py" ]; then
     echo "--- 按原厂实现重写面板驱动（反汇编依据）---"
@@ -755,7 +771,7 @@ fi
 #   lcm_resume 执行时 MODE 仍是 0(CMD)，切换 video 发生在其后的 dpmgr_path_start。
 #   把 dimming 同步前移到此处走正常命令队列，不切 MODE、不碰 CMDQ。
 #   必须在 LCM_STOCK 之后运行（后者重写 lcm_resume）。与 DIMMING_CMDMODE 互斥。
-if [ "${DIMMING_EARLY:-1}" = "1" ] && [ -f "$ROOT/scripts/patch_dimming_early.py" ]; then
+if [ "${DIMMING_EARLY:-0}" = "1" ] && [ -f "$ROOT/scripts/patch_dimming_early.py" ]; then
     if [ "${DIMMING_CMDMODE:-0}" = "1" ]; then
         die "DIMMING_EARLY 与 DIMMING_CMDMODE 互斥，且后者已证伪（CPU 裸写 MODE 触发 CMDQ 风暴）；请关闭 dimming_cmdmode"
     fi
@@ -765,7 +781,7 @@ if [ "${DIMMING_EARLY:-1}" = "1" ] && [ -f "$ROOT/scripts/patch_dimming_early.py
     echo "--- 根因修复：dimming 前移到 lcm_resume 同步推表（CMDQ-safe）---"
     "$PY" "$ROOT/scripts/patch_dimming_early.py" . || die "dimming early 修复失败"
 else
-    echo "跳过 dimming early 修复（DIMMING_EARLY=${DIMMING_EARLY:-1}）"
+    echo "跳过 dimming early 修复（DIMMING_EARLY=${DIMMING_EARLY:-0}）"
 fi
 
 
@@ -777,7 +793,7 @@ if [ "${DIMMING_CMDMODE:-0}" = "1" ] && [ -f "$ROOT/scripts/patch_dimming_cmdmod
     if [ "${DISP_DEBUG:-1}" != "1" ]; then
         die "dimming CMD-mode（已证伪）依赖 DISP_DEBUG=1（提供 s3pro_dsi_set_mode），请一起开启"
     fi
-    if [ "${DIMMING_EARLY:-1}" = "1" ]; then
+    if [ "${DIMMING_EARLY:-0}" = "1" ]; then
         die "dimming CMD-mode（已证伪）与 DIMMING_EARLY 互斥，请先关闭 dimming_early"
     fi
     echo "--- [已证伪实验] dimming 推表切 CMD mode（CPU 裸写，仅供回退对比）---"

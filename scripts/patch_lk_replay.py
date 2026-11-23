@@ -36,6 +36,9 @@
     echo 1 > /sys/kernel/debug/s3pro_lk/rst_new      # 1=RST_EN_NEW 与主 RST 同步（cappu 第二复位脚）
     echo 1 > /sys/kernel/debug/s3pro_lk/vsp_before   # 1=强制 VSP/VSN 先；2=强制 RST 先；0=按 variant
     echo 15 > /sys/kernel/debug/s3pro_lk/dly1        # 单独覆盖 d1(ms)；0 = 用 variant 默认
+    echo 2 > /sys/kernel/debug/s3pro_lk/table        # ★0=BOE A(23) 1=BOE B(109) 2=BOE A→B(LK) 3=BOE B→A
+                                                     #  4=SHARP(12) 5=SHARP→BOE A 6=BOE A→SHARP
+    echo 20 > /sys/kernel/debug/s3pro_lk/table_gap   # 两次推表之间的间隔 ms（默认 20）
 
 判据：
     dmesg | grep S3PRO_LKREPLAY   每次 resume 打印实际参数与实际 jiffies
@@ -71,6 +74,52 @@ u32 s3pro_lk_vsp_before;
 u32 s3pro_lk_dly1;
 u32 s3pro_lk_dly2;
 u32 s3pro_lk_dly3;
+/* Table selection. NOTE: the original report says LK pushes table A then table B
+ * back-to-back (A = unlock + config + display-on, B = the rest), while this driver
+ * only ever pushes one of them. Mode 2 reproduces the LK behaviour.
+ *   0 = A only (23)  1 = B only (109)  2 = A then B (LK way)  3 = B then A
+ */
+u32 s3pro_lk_table;
+/* gap between the two pushes in mode 2/3, ms */
+u32 s3pro_lk_table_gap;
+/* Wait between VSN↑ and RST↑, ms. 0 = use the variant default (24ms).
+ * The reference kernel that lights this panel uses 15ms here. */
+u32 s3pro_lk_vsn_dly;
+/* How many times the init table is pushed:
+ *   0 = once (default, what this port did)
+ *   1 = twice  (what the reference kernel does: resume pushes, then init() pushes again)
+ *   2 = three times
+ */
+u32 s3pro_lk_repeat;
+/* ★ resume_power 行为（LOS 14.1 实测：只开 regulator + 20ms，完全不碰 GPIO）
+ *   1 = 只等 20ms，不碰 GPIO   ← 默认，与 LOS 14.1 等价
+ *   0 = 保持原行为：拉 GPIO_LCD_1V8_EN（sed 后 = gpio_lcd_enp = ENP = pio96）+ 20ms
+ * 每次唤醒都会重新读这个变量，所以改完下次熄屏唤醒就生效，不需要重启。
+ */
+u32 s3pro_lk_no_power = 1;
+
+/* Sharp native init table, copied from kernel-patches/lcm-table/sharp_tables.c
+ * (Copyright 2018 XiaoMi, the panel this device actually has, wm 1536x2048).
+ *
+ * It is COMPLETELY DIFFERENT from the BOE table (23 items, starts with the
+ * 0xFF AA55A580 unlock). Sharp is 12 items, no 0xFF unlock, and uses
+ *   0xCE{F0,1F} / 0xCE{06} / 0xD7{00,2F} / 0x51{FF} / 0x55{02} / 0x53{24}
+ * instead. Keeping both compiled in lets us cross table x timing at runtime.
+ */
+static struct LCM_setting_table s3pro_sharp_table[] = {
+	{0x11, 0, {} },
+	{REGFLAG_DELAY, 120, {} },
+	{0xF0, 5, {0x55, 0xAA, 0x52, 0x08, 0x05} },
+	{0xCE, 2, {0xF0, 0x1F} },
+	{0xF0, 5, {0x55, 0xAA, 0x52, 0x08, 0x01} },
+	{0xCE, 1, {0x06} },
+	{0xD7, 2, {0x00, 0x2F} },
+	{0x51, 1, {0xFF} },
+	{0x55, 1, {0x02} },
+	{0x53, 1, {0x24} },
+	{0x29, 0, {} },
+	{REGFLAG_END_OF_TABLE, 0x00, {} },
+};
 
 static void s3pro_lk_dbg_init(void)
 {
@@ -92,6 +141,11 @@ static void s3pro_lk_dbg_init(void)
 	debugfs_create_u32("dly1", 0644, d, &s3pro_lk_dly1);
 	debugfs_create_u32("dly2", 0644, d, &s3pro_lk_dly2);
 	debugfs_create_u32("dly3", 0644, d, &s3pro_lk_dly3);
+	debugfs_create_u32("table", 0644, d, &s3pro_lk_table);
+	debugfs_create_u32("table_gap", 0644, d, &s3pro_lk_table_gap);
+	debugfs_create_u32("vsn_dly", 0644, d, &s3pro_lk_vsn_dly);
+	debugfs_create_u32("repeat", 0644, d, &s3pro_lk_repeat);
+	debugfs_create_u32("no_power", 0644, d, &s3pro_lk_no_power);
 	pr_alert("[S3PRO_LKREPLAY] debugfs ready: /sys/kernel/debug/s3pro_lk/\\n");
 }
 
@@ -99,16 +153,20 @@ static void s3pro_lk_dbg_init(void)
 
 NEW_RESUME = '''static void lcm_resume(void)
 {
-	u32 d1, d2, d3;
+	u32 d1, d2, d3, vsn_d;
+	u32 reps, gap;
 	int vsp_first;
 	int use_rst_new;
 
 	s3pro_lk_dbg_init();
 
+	vsn_d = 24;	/* default: the value this port always used */
+
 	switch (s3pro_lk_variant) {
 	case 1:  d1 = 12; d2 = 12; d3 = 32; vsp_first = 1; break;	/* original / LK full */
 	case 2:  d1 = 12; d2 = 12; d3 = 32; vsp_first = 0; break;	/* LK reset only */
 	case 3:  d1 = 20; d2 = 20; d3 = 50; vsp_first = 1; break;	/* original + longer */
+	case 4:  d1 = 5;  d2 = 2;  d3 = 15; vsp_first = 1; vsn_d = 15; break;	/* EXACT reference kernel */
 	default: d1 = 5;  d2 = 2;  d3 = 25; vsp_first = 0; break;	/* bbk stock, current */
 	}
 	if (s3pro_lk_vsp_before == 1)
@@ -121,18 +179,23 @@ NEW_RESUME = '''static void lcm_resume(void)
 		d2 = s3pro_lk_dly2;
 	if (s3pro_lk_dly3)
 		d3 = s3pro_lk_dly3;
-	use_rst_new = (s3pro_lk_rst_new != 0);
+	if (s3pro_lk_vsn_dly)
+		vsn_d = s3pro_lk_vsn_dly;
 
-	pr_alert("[S3PRO_LKREPLAY] resume var=%u vsp_first=%d rst_new=%d dly=%u/%u/%u j=%lu\\n",
-		 s3pro_lk_variant, vsp_first, use_rst_new, d1, d2, d3, jiffies);
+	use_rst_new = (s3pro_lk_rst_new != 0);
+	reps = (s3pro_lk_repeat >= 2) ? 3 : ((s3pro_lk_repeat == 1) ? 2 : 1);
+	gap = s3pro_lk_table_gap ? s3pro_lk_table_gap : 20;
+
+	pr_alert("[S3PRO_LKREPLAY] resume var=%u vsp_first=%d rst_new=%d dly=%u/%u/%u vsn_dly=%u reps=%u j=%lu\\n",
+		 s3pro_lk_variant, vsp_first, use_rst_new, d1, d2, d3, vsn_d, reps, jiffies);
 
 	if (vsp_first) {
 		lcm_set_gpio_output(GPIO_LCD_VSP_EN, GPIO_OUT_ONE);
 		pr_alert("[S3PRO_LKREPLAY] VSP=1 j=%lu\\n", jiffies);
 		MDELAY(2);
 		lcm_set_gpio_output(GPIO_LCD_VSN_EN, GPIO_OUT_ONE);
-		pr_alert("[S3PRO_LKREPLAY] VSN=1 j=%lu\\n", jiffies);
-		MDELAY(24);
+		pr_alert("[S3PRO_LKREPLAY] VSN=1 then wait %ums j=%lu\\n", vsn_d, jiffies);
+		MDELAY(vsn_d);
 	}
 
 	lcm_set_gpio_output(GPIO_LCD_RST_EN, GPIO_OUT_ONE);
@@ -162,16 +225,75 @@ NEW_RESUME = '''static void lcm_resume(void)
 		MDELAY(2);
 	}
 
-	if (s3pro_lcm_variant) {
-		LCM_LOGI("push init table B (109)\\n");
-		push_table(s3pro_init_table_b,
-			   sizeof(s3pro_init_table_b) / sizeof(struct LCM_setting_table), 1);
-	} else {
-		LCM_LOGI("push init table A (23)\\n");
-		push_table(s3pro_init_table_a,
-			   sizeof(s3pro_init_table_a) / sizeof(struct LCM_setting_table), 1);
+	{
+		u32 i;
+
+		/* The reference kernel pushes the init table once in resume and then
+		 * calls init(), which pushes the SAME table again. s3pro_lk_repeat
+		 * reproduces that: 0 = once, 1 = twice, 2 = three times. */
+		for (i = 0; i < reps; i++) {
+			if (i > 0) {
+				pr_alert("[S3PRO_LKREPLAY] re-push table #%u gap=%ums j=%lu\\n",
+					 i + 1, gap, jiffies);
+				MDELAY(gap);
+			}
+
+		switch (s3pro_lk_table) {
+		case 1:
+			pr_alert("[S3PRO_LKREPLAY] push BOE table B (109) j=%lu\\n", jiffies);
+			push_table(s3pro_init_table_b,
+				   sizeof(s3pro_init_table_b) / sizeof(struct LCM_setting_table), 1);
+			break;
+		case 2:
+			pr_alert("[S3PRO_LKREPLAY] push BOE A (23) then BOE B (109) gap=%ums j=%lu\\n",
+				 gap, jiffies);
+			push_table(s3pro_init_table_a,
+				   sizeof(s3pro_init_table_a) / sizeof(struct LCM_setting_table), 1);
+			MDELAY(gap);
+			push_table(s3pro_init_table_b,
+				   sizeof(s3pro_init_table_b) / sizeof(struct LCM_setting_table), 1);
+			break;
+		case 3:
+			pr_alert("[S3PRO_LKREPLAY] push BOE B (109) then BOE A (23) gap=%ums j=%lu\\n",
+				 gap, jiffies);
+			push_table(s3pro_init_table_b,
+				   sizeof(s3pro_init_table_b) / sizeof(struct LCM_setting_table), 1);
+			MDELAY(gap);
+			push_table(s3pro_init_table_a,
+				   sizeof(s3pro_init_table_a) / sizeof(struct LCM_setting_table), 1);
+			break;
+		case 4:
+			pr_alert("[S3PRO_LKREPLAY] push SHARP table (12) j=%lu\\n", jiffies);
+			push_table(s3pro_sharp_table,
+				   sizeof(s3pro_sharp_table) / sizeof(struct LCM_setting_table), 1);
+			break;
+		case 5:
+			pr_alert("[S3PRO_LKREPLAY] push SHARP (12) then BOE A (23) gap=%ums j=%lu\\n",
+				 gap, jiffies);
+			push_table(s3pro_sharp_table,
+				   sizeof(s3pro_sharp_table) / sizeof(struct LCM_setting_table), 1);
+			MDELAY(gap);
+			push_table(s3pro_init_table_a,
+				   sizeof(s3pro_init_table_a) / sizeof(struct LCM_setting_table), 1);
+			break;
+		case 6:
+			pr_alert("[S3PRO_LKREPLAY] push BOE A (23) then SHARP (12) gap=%ums j=%lu\\n",
+				 gap, jiffies);
+			push_table(s3pro_init_table_a,
+				   sizeof(s3pro_init_table_a) / sizeof(struct LCM_setting_table), 1);
+			MDELAY(gap);
+			push_table(s3pro_sharp_table,
+				   sizeof(s3pro_sharp_table) / sizeof(struct LCM_setting_table), 1);
+			break;
+		default:
+			pr_alert("[S3PRO_LKREPLAY] push BOE table A (23) j=%lu\\n", jiffies);
+			push_table(s3pro_init_table_a,
+				   sizeof(s3pro_init_table_a) / sizeof(struct LCM_setting_table), 1);
+			break;
+		}
+		}
 	}
-	pr_alert("[S3PRO_LKREPLAY] table pushed j=%lu\\n", jiffies);
+	pr_alert("[S3PRO_LKREPLAY] table done (reps=%u) j=%lu\\n", reps, jiffies);
 
 	/* NOTE: patch_dimming_early.py anchors on this exact line, keep it intact */
 	schedule_delayed_work(&open_lcm_dimming, msecs_to_jiffies(500));
@@ -182,6 +304,47 @@ NEW_RESUME = '''static void lcm_resume(void)
 
 RESUME_START = "static void lcm_resume(void)"
 RESUME_END_HINT = "/* 旧初始化表/睡眠表仍留在文件里但不再被调用"
+
+# ---- lcm_resume_power：LOS 14.1 的 resume_power 不碰 GPIO（regulator 供 1.8V）----
+# 锚点是 patch_lcm_stock.py 重写后的样子
+RESUME_POWER_OLD = '''static void lcm_resume_power(void)
+{
+\tLCM_LOGI("%s, begin\\n", __func__);
+
+\t/* 原厂 resume_power：1V8 上电 + 20ms */
+\tlcm_set_gpio_output(GPIO_LCD_1V8_EN, GPIO_OUT_ONE);
+\tMDELAY(20);
+
+\tLCM_LOGI("%s, end\\n", __func__);
+}'''
+
+RESUME_POWER_NEW = '''static void lcm_resume_power(void)
+{
+\tLCM_LOGI("%s, begin\\n", __func__);
+
+\t/* S3PRO_LKREPLAY: LOS 14.1 实测的 resume_power 是
+\t *     lcm_vgp_supply_enable()  (regulator_set_voltage 1.8V + enable)
+\t *     mdelay(20)
+\t * 完全不碰任何 GPIO。1.8V 由 PMIC 的 VGP LDO 提供（DTB: reg-lcm-1v8-supply）。
+\t *
+\t * 而我们的 GPIO_LCD_1V8_EN 被 build.sh 的 sed 映射成了 gpio_lcd_enp
+\t * （= ENP = pio 96，和 VSP 同一个脚），原代码会在 resume 之前就
+\t * 把 ENP 拉高，比 LOS 14.1 提前了一段。
+\t *
+\t * no_power=1（默认）-> 只等 20ms，与 LOS 14.1 等价
+\t * no_power=0        -> 保持原行为（拉 ENP + 20ms），用于对照
+\t * 每次唤醒都会读这个变量，改完下次熄屏唤醒即生效，无需重启。
+\t */
+\tpr_alert("[S3PRO_LKREPLAY] resume_power no_power=%u\\n", s3pro_lk_no_power);
+\tif (s3pro_lk_no_power) {
+\t\tMDELAY(20);
+\t} else {
+\t\tlcm_set_gpio_output(GPIO_LCD_1V8_EN, GPIO_OUT_ONE);
+\t\tMDELAY(20);
+\t}
+
+\tLCM_LOGI("%s, end\\n", __func__);
+}'''
 
 
 def find_driver(tree):
@@ -305,6 +468,15 @@ def main():
     t = t[:si] + PRELUDE + NEW_RESUME + "\n" + t[ei:]
     print("  已替换 lcm_resume 为可调时序版本（含 RST_EN_NEW 开关）")
 
+    # lcm_resume_power：加 no_power 开关（默认不碰 GPIO，对齐 LOS 14.1）
+    if t.count(RESUME_POWER_OLD) != 1:
+        print("!! lcm_resume_power 锚点匹配 %d 次（应为 1），中止"
+              % t.count(RESUME_POWER_OLD))
+        print("   （patch_lcm_stock.py 的 resume_power 模板可能变了？）")
+        return 1
+    t = t.replace(RESUME_POWER_OLD, RESUME_POWER_NEW, 1)
+    print("  已给 lcm_resume_power 加 no_power 开关（默认=1，不碰 GPIO）")
+
     need = []
     for hdr in ("linux/debugfs.h", "linux/err.h", "linux/jiffies.h"):
         if "#include <%s>" % hdr not in t:
@@ -329,6 +501,24 @@ def main():
         "变量已定义": "u32 s3pro_lk_variant;" in c,
         "debugfs variant 节点": 'debugfs_create_u32("variant"' in c,
         "debugfs rst_new 节点": 'debugfs_create_u32("rst_new"' in c,
+        "debugfs table 节点": 'debugfs_create_u32("table"' in c,
+        "debugfs vsn_dly 节点": 'debugfs_create_u32("vsn_dly"' in c,
+        "debugfs repeat 节点": 'debugfs_create_u32("repeat"' in c,
+        "debugfs no_power 节点": 'debugfs_create_u32("no_power"' in c,
+        "no_power 变量默认1": "u32 s3pro_lk_no_power = 1;" in c,
+        "resume_power 用 no_power": "if (s3pro_lk_no_power) {" in c,
+        "resume_power 仍保留原分支": "lcm_set_gpio_output(GPIO_LCD_1V8_EN, GPIO_OUT_ONE);" in c,
+        "variant4 精确复刻(5/2/15)": "case 4:  d1 = 5;  d2 = 2;  d3 = 15;" in c,
+        "vsn_dly 变量生效": "MDELAY(vsn_d);" in c,
+        "二次推表循环": "re-push table #%u" in c,
+        "table done 带 reps": "table done (reps=%u)" in c,
+        "BOE A→B 连发": "push BOE A (23) then BOE B (109)" in c,
+        "BOE B→A 连发": "push BOE B (109) then BOE A (23)" in c,
+        "sharp 表定义": "s3pro_sharp_table[]" in c,
+        "sharp 表特征 0xCE": "0xCE, 2, {0xF0, 0x1F}" in c,
+        "sharp 表分支": "push SHARP table (12)" in c,
+        "sharp+BOE 组合": "push SHARP (12) then BOE A (23)" in c,
+        "BOE+sharp 组合": "push BOE A (23) then SHARP (12)" in c,
         "pr_alert 时间戳": "[S3PRO_LKREPLAY] resume" in c,
         "下游锚点保留": "schedule_delayed_work(&open_lcm_dimming, msecs_to_jiffies(500));" in c,
         "RST_EN_NEW 开关": "GPIO_LCD_RST_EN_NEW" in c,
